@@ -17,15 +17,14 @@ SECRET = os.environ["JWT_SECRET"]  # required
 TEACHER_CODE = os.getenv("TEACHER_CODE", "")
 ALOC = os.getenv("ALOC_BASE", "https://dev.aloc.com.ng/api/v1")
 ALOC_KEY = os.getenv("ALOC_TOKEN", "")
-MODEL = os.getenv("CLAUDE_MODEL", "")
 PRODUCTION = os.getenv("APP_ENV") == "production"
 if PRODUCTION:
     if not DB.startswith("postgresql+psycopg2://"):
         raise RuntimeError("Production requires DATABASE_URL pointing to PostgreSQL.")
     if len(SECRET) < 32 or SECRET.startswith("change-me"):
         raise RuntimeError("Production JWT_SECRET must be a random value of at least 32 characters.")
-    if not ALOC_KEY or not os.getenv("ANTHROPIC_API_KEY") or not MODEL:
-        raise RuntimeError("Set ALOC_TOKEN, ANTHROPIC_API_KEY and CLAUDE_MODEL before production startup.")
+    if not ALOC_KEY:
+        raise RuntimeError("Set ALOC_TOKEN before production startup.")
 EXAM_MIN = int(os.getenv("EXAM_MINUTES", "120"))
 GRACE = 30  # seconds allowed after the deadline for the final submit
 
@@ -490,61 +489,31 @@ def submit(aid: int, b: AnsIn, u=Depends(me), s=Depends(db)):
 
 
 # ---------- teacher: PDF -> test ----------
-PROMPT = """You are preparing a Nigerian JAMB/UTME-style objective test from the attached PDF.
-Extract EVERY multiple-choice question, in order. For each give the question text, the options
-(2 to 5, without their letter labels) and "a", the 0-based index of the correct option.
-If the PDF contains an answer key, use it. Otherwise work out the correct answer carefully yourself.
-Set "review": true if you are not confident, if the question depends on a diagram or passage you cannot
-see, or if the text is unclear. Keep maths readable in plain text (use <sup>/<sub> for powers/subscripts).
-Return ONLY JSON: {"questions":[{"q":"...","o":["...","..."],"a":0,"review":false}]}"""
-
-
-def ai_extract(pdf: bytes):
-    import anthropic
-    if not MODEL:
-        raise HTTPException(503, "CLAUDE_MODEL must be configured with a model available to your account.")
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise HTTPException(503, "ANTHROPIC_API_KEY is not set on the server.")
-    with anthropic.Anthropic().messages.stream(
-        model=MODEL, max_tokens=16000,
-        messages=[{"role": "user", "content": [
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                            "data": base64.b64encode(pdf).decode()}},
-            {"type": "text", "text": PROMPT}]}],
-    ) as st:
-        msg = st.get_final_message()
-    if msg.stop_reason == "max_tokens":
-        raise HTTPException(422, "This PDF has too many questions for one go. Split it into parts of about 60 questions.")
-    txt = "".join(b.text for b in msg.content if b.type == "text")
-    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip(), flags=re.M).strip()
+def extract_objectives(pdf: bytes):
+    import subprocess, sys
+    from objective_parser import parse_objectives
     try:
-        qs = json.loads(txt)["questions"]
-    except Exception:
-        raise HTTPException(502, "The AI reply could not be read. Please try the upload again.")
-    out = []
-    if not isinstance(qs, list) or not 1 <= len(qs) <= 100:
-        raise HTTPException(422, "The PDF must contain between 1 and 100 questions.")
-    for x in qs:
-        if not isinstance(x, dict) or not isinstance(x.get("o"), list):
-            raise HTTPException(422, "Invalid extraction. Please correct or split the PDF.")
-        o = [clean(i) for i in x.get("o", []) if str(i).strip()]
-        a = x.get("a")
-        if 2 <= len(o) <= 5 and type(a) is int and 0 <= a < len(o) and str(x.get("q", "")).strip():
-            out.append({"q": clean(x["q"]), "o": o, "a": a, "review": bool(x.get("review"))})
-    if len(out) != len(qs):
-        raise HTTPException(422, "Some questions could not be extracted safely. Please correct or split the PDF.")
-    if not out:
-        raise HTTPException(422, "No multiple-choice questions were found in this PDF.")
-    return out
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "extract_pdf.py")],
+            input=pdf, capture_output=True, timeout=25, check=True)
+        questions = parse_objectives(result.stdout.decode("utf-8"))
+        if any(not q["correctAnswer"] for q in questions):
+            raise ValueError("Every question must have an answer. Add an Answer key section or Answer: B after each question.")
+        return [{"q": clean(q["text"]), "o": [clean(v) for v in q["options"].values()],
+                 "a": list(q["options"]).index(q["correctAnswer"]), "review": False} for q in questions]
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except (subprocess.SubprocessError, UnicodeError):
+        raise HTTPException(422, "Use a text PDF, up to 25 pages and 10 MB, without images or diagrams. Scanned PDFs cannot be read. Follow the example format below.")
 
 
 @app.post("/api/teacher/tests/upload")
 def upload(file: UploadFile = File(...), title: str = Form(...), subject: str = Form("General"),
            minutes: int = Form(60), publish: bool = Form(True), u=Depends(teacher), s=Depends(db)):
-    data = file.file.read(20 * 1024 * 1024 + 1)
-    if len(data) > 20 * 1024 * 1024 or not data.startswith(b"%PDF"):
-        raise HTTPException(422, "Upload a PDF smaller than 20 MB.")
-    qs = ai_extract(data)
+    data = file.file.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024 or not data.startswith(b"%PDF"):
+        raise HTTPException(422, "Upload a PDF smaller than 10 MB.")
+    qs = extract_objectives(data)
     t = Test(title=title.strip()[:200], subject=subject.strip()[:80] or "General",
              minutes=max(5, min(minutes, 180)), published=False, owner_id=u.id)
     s.add(t); s.flush()

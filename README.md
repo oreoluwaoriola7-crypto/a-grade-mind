@@ -13,7 +13,6 @@ This package updates agrademind(1).zip. It is the lightweight HTML/JavaScript + 
 ## Deployment
 1. Back up any existing database. Use a dedicated PostgreSQL database (for example a Supabase server connection with SSL). Do not put connection credentials in browser code.
 2. Put this folder in your repository. Configure a Python web service using render.yaml or equivalent.
-3. Set DATABASE_URL, a strong random JWT_SECRET, TEACHER_CODE, ALOC_TOKEN, ANTHROPIC_API_KEY and CLAUDE_MODEL. Select an actual PDF-capable model available in your Anthropic account; the old unverified default was removed. No API keys are bundled.
 4. Install with `pip install -r requirements.txt`.
 5. Start with `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1` behind HTTPS. The single worker keeps the in-memory ALOC cache and login throttling consistent. PostgreSQL connection pool: 10 connections, 10 overflow.
 6. Tables are created on startup, including additive auth_state and auth_audit tables. Existing user tables are preserved. Test upgrades against a database copy first.
@@ -22,7 +21,6 @@ This package updates agrademind(1).zip. It is the lightweight HTML/JavaScript + 
 
 ## Checks before opening to students
 - Test signup, reset, expiry, login and a real PDF on the deployed host.
-- Teachers must check every extracted question and answer, including unflagged ones: AI confidence is not a correctness guarantee. Diagrams are not rendered from PDFs; rewrite those questions or do not publish the test.
 - Confirm ALOC subject coverage and quota. IRS, History and Yoruba were not available under the previously tested mappings. Other subjects may also be unavailable depending on the account. No replacement questions are fabricated.
 - ALOC pools are process-local and lost on restart. Prewarm and test the chosen subject combinations; check provider storage/use terms. Do not assume the free quota can serve an exam session.
 - Conduct an 80-student rehearsal against the real PostgreSQL/hosting setup. This package has not been load-tested for 80 simultaneous users.
@@ -35,3 +33,8 @@ Tests cover the complete reset/token/expiry flow, authorization, draft publishin
 
 ## Local development
 Use Python 3.12, a virtual environment, and the values described in .env.example. Export environment variables before starting (the app does not automatically load .env). SQLite fallback is for local development only; use PostgreSQL for deployment. Never commit .env, database files or API keys.
+
+## No-AI PDF tests
+No AI provider or AI key is required. Provide 1–100 numbered questions with A–D or A–E options, followed by an Answer key section with entries such as 1. B. Every question needs an answer. Upload a text PDF (maximum 10 MB, 25 pages). Scans and image-bearing PDFs are rejected. Review the draft before publishing. Tests use the teacher key for deterministic marking.
+
+Required server settings: DATABASE_URL, JWT_SECRET, ALOC_TOKEN; TEACHER_CODE for initial teacher registration. The existing Supabase application tables have been provisioned. Set the database connection privately in Render. Free hosting may still require provider account verification.

@@ -34,7 +34,7 @@ def test_reset_workflow():
 
 def test_publish_gate_and_scoring(monkeypatch):
     teacher=signup('08000000003','teacher'); student=signup('08000000004')
-    monkeypatch.setattr(m,'ai_extract',lambda pdf:[{'q':'2 + 2?','o':['3','4'],'a':1,'review':True}])
+    monkeypatch.setattr(m,'extract_objectives',lambda pdf:[{'q':'2 + 2?','o':['3','4'],'a':1,'review':True}])
     r=c.post('/api/teacher/tests/upload',headers=teacher,data={'title':'Math'},files={'file':('test.pdf',b'%PDF mock','application/pdf')})
     assert r.status_code==200 and not r.json()['published']
     tid=r.json()['id']
@@ -59,3 +59,21 @@ def test_aloc_contract(monkeypatch):
         return m.httpx.Response(200,json={'data':[row]})
     monkeypatch.setattr(m,'ALOC_KEY','test-key');monkeypatch.setattr(m.httpx,'get',get)
     assert m.fetch_aloc('english',1)[0][0]['a']==1
+
+def test_real_pdf_and_missing_key():
+    import io
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    def pdf(lines):
+        w=PdfWriter(); page=w.add_blank_page(width=600,height=800)
+        font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
+        page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):w._add_object(font)})})
+        stream=DecodedStreamObject();stream.set_data(('BT /F1 12 Tf 40 750 Td 18 TL '+ ' '.join('('+s+') Tj T*' for s in lines)+' ET').encode())
+        page[NameObject('/Contents')]=w._add_object(stream)
+        buf=io.BytesIO();w.write(buf);return buf.getvalue()
+    lines=['1. What is 2 + 2?','A. 3','B. 4','C. 5','D. 6']
+    result=m.extract_objectives(pdf(lines+['Answer key','1. B']))
+    assert result[0]['a']==1 and result[0]['o']==['3','4','5','6']
+    import pytest
+    with pytest.raises(m.HTTPException) as err:m.extract_objectives(pdf(lines))
+    assert err.value.status_code==422

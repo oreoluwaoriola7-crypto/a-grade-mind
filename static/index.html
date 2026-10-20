@@ -57,11 +57,18 @@ label{display:block;font-size:.9rem}hr{border:0;border-top:1px solid var(--bd);m
 <section id="login"><div class="w"><h2>Login</h2><div class="grid">
 <div class="card" id="acc"></div>
 <div class="card hide" id="tch"><h3>Teacher: upload a test PDF</h3>
-<p class="mu">Upload a PDF of objective questions. AI reads it, works out the correct answers (or uses the key in your PDF), and the test goes live for students. Questions it is unsure about are flagged for you to check.</p>
+<p class="mu">Upload objective questions with your answer key. Review the extracted draft, then publish it for students. Answers are marked automatically against your key out of 100.</p>
 <label>Test title<input type="text" id="tt" placeholder="e.g. Chemistry Mock 1"></label>
 <label>Subject<input type="text" id="ts" placeholder="Chemistry"></label>
 <label>Minutes<input type="number" id="tm2" value="60" min="5" max="180"></label>
-<input type="file" id="pf" accept="application/pdf"><p class="mu" id="pm"></p>
+<p>Upload a text PDF (maximum 10 MB / 25 pages). Number questions 1., 2., etc., with choices A–D or A–E. Include an Answer key section: 1. B, 2. C. Scans and images are not supported. No AI is used.</p><details><summary>Example PDF format</summary><pre>1. What is 2 + 2?
+A. 3
+B. 4
+C. 5
+D. 6
+
+Answer key
+1. B</pre></details><input type="file" id="pf" accept="application/pdf"><p class="mu" id="pm"></p>
 <button class="btn" id="pu">Upload for review</button>
 <h3 style="margin-top:20px">Reset a student's password</h3>
 <input type="tel" id="rph" placeholder="Student phone number" inputmode="numeric"><input type="text" id="rpw" placeholder="Temporary password (10+ characters)">
@@ -154,7 +161,7 @@ else if(d.a){var p=d.a.split(",");api("/teacher/tests/"+p[0]+"/questions/"+p[1],
 else if(e.target.id==="rp"){api("/teacher/students/reset",{json:{phone:$("rph").value,password:$("rpw").value}}).then(function(r){$("rm").textContent="Done. "+r.username+" has 24 hours to log in and choose a new password.";$("rpw").value=""}).catch(function(er){$("rm").textContent=er.message})}
 else if(e.target.id==="pu"){var f=$("pf").files[0];if(!f||!$("tt").value.trim()){$("pm").textContent="Add a title and choose a PDF.";return}
 var fd=new FormData();fd.append("file",f);fd.append("title",$("tt").value);fd.append("subject",$("ts").value||"General");fd.append("minutes",$("tm2").value||60);
-e.target.disabled=true;$("pm").textContent="Reading your PDF. This can take a minute...";
+e.target.disabled=true;$("pm").textContent="Reading questions and your answer key...";
 api("/teacher/tests/upload",{method:"POST",body:fd}).then(function(r){$("pm").textContent="Draft saved: "+r.count+" questions. Check the answers, then select Publish. "+(r.flagged?r.flagged+" flagged for you to check.":"No flags.");$("pf").value="";tlist();review(r.id)})
 .catch(function(er){$("pm").textContent=er.message}).then(function(){$("pu").disabled=false})}};
 paint();

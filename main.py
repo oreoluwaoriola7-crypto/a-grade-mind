@@ -298,7 +298,7 @@ def norm(x):
         if not x.get("text") or len(keys) < 2 or answer not in keys:
             return None
         img = str(x.get("imageUrl") or "")
-        passage = x.get("passage") or ""
+        passage = x.get("section") or x.get("passage") or ""
         if x.get("hasPassage") and not isinstance(passage, str):
             return None
         if x.get("hasPassage") and not passage:
@@ -310,12 +310,12 @@ def norm(x):
         return None
 
 
-def fetch_aloc(slug, n=40):
+def _aloc_page(slug, n, cursor=None):
     if not ALOC_KEY:
         raise HTTPException(503, "ALOC_TOKEN is not set on the server.")
     try:
         r = httpx.get(ALOC.rstrip("/") + "/questions",
-                      params={"subject": slug, "examType": "jamb", "limit": n}, timeout=20,
+                      params={"subject": slug, "examType": "jamb", "limit": min(n, 15), **({"cursor": cursor} if cursor else {})}, timeout=20,
                       headers={"X-API-Key": ALOC_KEY, "Accept": "application/json"})
         if r.status_code != 200:
             detail = ""
@@ -339,50 +339,44 @@ def fetch_aloc(slug, n=40):
         out = [q for q in map(norm, items) if q]
         if not out:
             raise HTTPException(502, "No usable questions available for this subject.")
-        return out, "/questions"
+        return out, r.json().get("pagination", {})
     except (httpx.HTTPError, ValueError):
         raise HTTPException(502, "Question provider is unavailable. Please try later.")
+
+
+def fetch_aloc(slug, n=40):
+    questions, cursor, seen_cursors = {}, None, set()
+    # Bounded pagination; never keep requesting the same page or inflate scores
+    # by repeating questions. ALOC caps each page at 15.
+    for _ in range(12):
+        rows, pagination = _aloc_page(slug, min(15, n - len(questions)), cursor)
+        for q in rows:
+            questions[q["id"] if q["id"] is not None else q["q"]] = q
+        if len(questions) >= n:
+            break
+        cursor = pagination.get("nextCursor")
+        if not pagination.get("hasMore") or not cursor or cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+    return list(questions.values())[:n], "/questions"
 
 
 POOL, LOCKS = {}, defaultdict(threading.Lock)
 
 
-def _fill(slug, target):
-    p = POOL.setdefault(slug, {})
-    for _ in range(5):
-        if len(p) >= target:
-            break
-        items, _ = fetch_aloc(slug, 40)
-        for it in items:
-            p[it["id"] if it["id"] is not None else it["q"][:80]] = it
-
-
 def get_q(slug, n):
-    p = POOL.setdefault(slug, {})
-    if len(p) < n * 3:
-        with LOCKS[slug]:  # one refill at a time: protects ALOC when many students start together
-            try:
-                _fill(slug, n * 3)
-            except HTTPException:
-                if len(p) < n:
-                    raise
-    if len(p) < 600:
-        threading.Thread(target=lambda: _safe(slug), daemon=True).start()
-    vals = list(p.values())
+    # Reuse a subject bank across students instead of refilling in background
+    # on every exam start. This avoids wasting the provider's free quota.
+    with LOCKS[slug]:
+        p = POOL.setdefault(slug, {})
+        if len(p) < n:
+            items, _ = fetch_aloc(slug, n)
+            for q in items:
+                p[q["id"] if q["id"] is not None else q["q"]] = q
+        vals = list(p.values())
     if len(vals) < n:
         raise HTTPException(503, "Not enough distinct questions for a full exam. Please ask your teacher to check the question-bank plan.")
     return random.sample(vals, n)
-
-
-def _safe(slug):
-    try:
-        if LOCKS[slug].acquire(blocking=False):
-            try:
-                _fill(slug, len(POOL.get(slug, {})) + 40)
-            finally:
-                LOCKS[slug].release()
-    except Exception:
-        pass
 
 
 @app.get("/api/health")

@@ -90,3 +90,26 @@ def test_provider_error_explains_rejection_without_exposing_token(monkeypatch):
     assert 'Invalid subject' in err.value.detail
     assert 'aloc_test_secret' not in err.value.detail
     assert 'key=secret' not in err.value.detail
+
+
+def test_aloc_pagination_and_shared_bank(monkeypatch):
+    calls = []
+    def get(url, **kw):
+        params = kw['params']; calls.append(params)
+        assert 1 <= params['limit'] <= 15
+        start = int(params.get('cursor', '0'))
+        end = min(start + params['limit'], 60)
+        rows = [{'id': str(i), 'text': f'Question {i}', 'options': {'a':'yes','b':'no'}, 'correctAnswer':'a'} for i in range(start,end)]
+        return m.httpx.Response(200,json={'data':rows,'pagination':{'hasMore':end<60,'nextCursor':str(end)}})
+    monkeypatch.setattr(m,'ALOC_KEY','test-key')
+    monkeypatch.setattr(m.httpx,'get',get)
+    monkeypatch.setattr(m,'POOL',{})
+    assert len(m.get_q('english',60)) == 60
+    assert len(calls) == 4
+    assert len(m.get_q('english',60)) == 60
+    assert len(calls) == 4
+
+
+def test_aloc_comprehension_section():
+    q=m.norm({'id':'p1','text':'What happened?', 'options':{'a':'A','b':'B'},'correctAnswer':'a','hasPassage':True,'section':'The passage.'})
+    assert q['q'].startswith('The passage.')

@@ -625,5 +625,14 @@ def start_test(tid: int, u=Depends(me), s=Depends(db)):
     return payload(a)
 
 
+@app.get("/api/results")
+def student_results(u=Depends(me), s=Depends(db)):
+    import datetime
+    return [{"id": a.id, "title": a.title, "score": a.score,
+             "out_of": 400 if a.kind == "aloc" else 100,
+             "created_at": datetime.datetime.fromtimestamp(a.created, datetime.timezone.utc).isoformat()}
+            for a in s.query(Attempt).filter_by(user_id=u.id, submitted=True).order_by(Attempt.id.desc()).limit(100)]
+
+
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

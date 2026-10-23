@@ -318,7 +318,21 @@ def fetch_aloc(slug, n=40):
                       params={"subject": slug, "examType": "jamb", "limit": n}, timeout=20,
                       headers={"X-API-Key": ALOC_KEY, "Accept": "application/json"})
         if r.status_code != 200:
-            raise HTTPException(502, f"Question provider returned HTTP {r.status_code}. Try later or contact your teacher.")
+            detail = ""
+            try:
+                payload = r.json()
+                if isinstance(payload, dict):
+                    detail = payload.get("message") or payload.get("error") or ""
+                if not isinstance(detail, str):
+                    detail = ""
+                detail = detail.replace(ALOC_KEY, "[redacted]")
+                detail = re.sub(r"(?i)(?:aloc_|alc_)[a-z0-9_-]+", "[redacted]", detail)
+                detail = re.sub(r"https?://\S+", "[provider link]", detail)
+                detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)[:300]
+            except ValueError:
+                pass
+            reason = f" {detail}" if detail else " Please contact your teacher."
+            raise HTTPException(502, f"Question provider returned HTTP {r.status_code} for {slug}.{reason}")
         items = r.json().get("data", [])
         if not isinstance(items, list):
             raise ValueError("Invalid provider response")

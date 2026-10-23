@@ -77,3 +77,16 @@ def test_real_pdf_and_missing_key():
     import pytest
     with pytest.raises(m.HTTPException) as err:m.extract_objectives(pdf(lines))
     assert err.value.status_code==422
+
+
+def test_provider_error_explains_rejection_without_exposing_token(monkeypatch):
+    import pytest
+    monkeypatch.setattr(m, 'ALOC_KEY', 'aloc_test_secret')
+    monkeypatch.setattr(m.httpx, 'get', lambda *a, **k: m.httpx.Response(400, json={
+        'message': 'Invalid subject. aloc_test_secret https://example.com/?key=secret'}))
+    with pytest.raises(m.HTTPException) as err:
+        m.fetch_aloc('english')
+    assert 'HTTP 400 for english' in err.value.detail
+    assert 'Invalid subject' in err.value.detail
+    assert 'aloc_test_secret' not in err.value.detail
+    assert 'key=secret' not in err.value.detail

@@ -101,6 +101,21 @@ class AuthAudit(Base):
     created = Column(Float, default=time.time)
 
 
+class QuestionBank(Base):
+    __tablename__ = "question_bank"
+    subject = Column(String(80), primary_key=True)
+    fingerprint = Column(String(64), primary_key=True)
+    data = Column(JSON, nullable=False)
+
+
+class BankProgress(Base):
+    __tablename__ = "question_bank_progress"
+    subject = Column(String(80), primary_key=True)
+    cursor = Column(String, nullable=True)
+    exhausted = Column(Boolean, nullable=False, default=False)
+    retry_after = Column(Float, nullable=False, default=0)
+
+
 Base.metadata.create_all(engine)
 # Existing flagged tests must also respect the publishing gate after upgrade.
 with Session.begin() as session:
@@ -108,6 +123,7 @@ with Session.begin() as session:
         # Backend connects as table owner; public Supabase Data API roles receive no policies.
         for table in Base.metadata.sorted_tables:
             session.execute(text(f'ALTER TABLE "{table.name}" ENABLE ROW LEVEL SECURITY'))
+            session.execute(text(f'REVOKE ALL ON TABLE "{table.name}" FROM anon, authenticated'))
     session.execute(update(Test).where(Test.id.in_(
         session.query(TQ.test_id).filter(TQ.review == True)
     )).values(published=False))
@@ -361,22 +377,74 @@ def fetch_aloc(slug, n=40):
     return list(questions.values())[:n], "/questions"
 
 
-POOL, LOCKS = {}, defaultdict(threading.Lock)
+LOCKS = defaultdict(threading.Lock)
+START_LOCKS = defaultdict(threading.Lock)
 
 
-def get_q(slug, n):
-    # Reuse a subject bank across students instead of refilling in background
-    # on every exam start. This avoids wasting the provider's free quota.
-    with LOCKS[slug]:
-        p = POOL.setdefault(slug, {})
-        if len(p) < n:
-            items, _ = fetch_aloc(slug, n)
-            for q in items:
-                p[q["id"] if q["id"] is not None else q["q"]] = q
-        vals = list(p.values())
-    if len(vals) < n:
-        raise HTTPException(503, "Not enough distinct questions for a full exam. Please ask your teacher to check the question-bank plan.")
-    return random.sample(vals, n)
+def question_key(q):
+    # Stable across provider ID changes and shuffled options.
+    value = json.dumps([q["q"].strip(), sorted(q["o"])], ensure_ascii=False)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def question_history(s, uid):
+    history = defaultdict(dict)
+    for data, created in s.query(Attempt.qdata, Attempt.created).filter_by(user_id=uid, kind="aloc").all():
+        for q in data or []:
+            slug = SLUG.get(q.get("s"))
+            if not slug:
+                continue
+            key = question_key(q)
+            count, last = history[slug].get(key, (0, 0))
+            history[slug][key] = (count + 1, max(last, created or 0))
+    return history
+
+
+def get_q(slug, n, seen=None):
+    seen = seen or {}
+    error = None
+    with LOCKS[slug], Session() as bank:
+        if engine.dialect.name == "postgresql":
+            # Serialise bank advancement across overlapping Render deploys.
+            lock_id = int.from_bytes(hashlib.sha256(slug.encode()).digest()[:4], "big")
+            bank.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_id})
+        progress = bank.get(BankProgress, slug)
+        if progress is None:
+            progress = BankProgress(subject=slug, exhausted=False, retry_after=0)
+            bank.add(progress)
+        questions = {q.fingerprint: q.data for q in bank.query(QuestionBank).filter_by(subject=slug).all()}
+        # Grow on demand, retaining cursor position across students and restarts.
+        # Bound each start to eight pages; stop on quota/rate errors instead of retrying.
+        for _ in range(8):
+            unseen = sum(key not in seen for key in questions)
+            if unseen >= n + 15 or progress.exhausted or progress.retry_after > time.time():
+                break
+            try:
+                rows, pagination = _aloc_page(slug, 15, progress.cursor)
+            except HTTPException as exc:
+                error = exc
+                progress.retry_after = time.time() + 300
+                break
+            for q in rows:
+                key = question_key(q)
+                if key not in questions:
+                    bank.add(QuestionBank(subject=slug, fingerprint=key, data=q))
+                    questions[key] = q
+            next_cursor = pagination.get("nextCursor")
+            if not pagination.get("hasMore") or not next_cursor or next_cursor == progress.cursor:
+                progress.exhausted = True
+            else:
+                progress.cursor = next_cursor
+        bank.commit()
+    if len(questions) < n:
+        if error:
+            raise error
+        raise HTTPException(503, "Not enough distinct questions for a full exam. Please ask your teacher to check the question bank.")
+    keys = list(questions)
+    random.shuffle(keys)
+    # Unseen first, then least frequent and oldest; randomise equal-priority ties.
+    keys.sort(key=lambda k: seen.get(k, (0, 0)))
+    return [{**questions[k], "repeated": k in seen} for k in keys[:n]]
 
 
 @app.get("/api/health")
@@ -398,6 +466,7 @@ def aloc_test(u=Depends(teacher)):
 def payload(a):
     return {"id": a.id, "kind": a.kind, "title": a.title, "deadline": a.deadline, "now": time.time(),
             "answers": a.answers or {},
+            "repeated_questions": sum(bool(q.get("repeated")) for q in a.qdata),
             "questions": [{"s": q["s"], "q": q["q"], "o": q["o"], "img": q.get("img", "")} for q in a.qdata]}
 
 
@@ -450,6 +519,11 @@ def get_active(u=Depends(me), s=Depends(db)):
 
 @app.post("/api/exams/start")
 def start_exam(b: StartIn, u=Depends(me), s=Depends(db)):
+    with START_LOCKS[u.id]:
+        return create_exam(b, u, s)
+
+
+def create_exam(b, u, s):
     a = active(s, u.id)
     if a:
         return payload(a)
@@ -457,8 +531,9 @@ def start_exam(b: StartIn, u=Depends(me), s=Depends(db)):
     if len(subs) != 3:
         raise HTTPException(422, "Pick exactly 3 subjects besides Use of English.")
     qd = []
+    history = question_history(s, u.id)
     for sub in ["Use of English"] + subs:
-        for q in get_q(SLUG[sub], 60 if sub == "Use of English" else 40):
+        for q in get_q(SLUG[sub], 60 if sub == "Use of English" else 40, history[SLUG[sub]]):
             qd.append({**q, "s": sub})
     a = Attempt(user_id=u.id, kind="aloc", title="JAMB practice", qdata=qd, answers={},
                 deadline=time.time() + EXAM_MIN * 60)

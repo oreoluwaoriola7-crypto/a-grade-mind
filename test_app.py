@@ -103,7 +103,8 @@ def test_aloc_pagination_and_shared_bank(monkeypatch):
         return m.httpx.Response(200,json={'data':rows,'pagination':{'hasMore':end<60,'nextCursor':str(end)}})
     monkeypatch.setattr(m,'ALOC_KEY','test-key')
     monkeypatch.setattr(m.httpx,'get',get)
-    monkeypatch.setattr(m,'POOL',{})
+    with m.Session.begin() as db:
+        db.query(m.QuestionBank).delete(); db.query(m.BankProgress).delete()
     assert len(m.get_q('english',60)) == 60
     assert len(calls) == 4
     assert len(m.get_q('english',60)) == 60
@@ -113,3 +114,59 @@ def test_aloc_pagination_and_shared_bank(monkeypatch):
 def test_aloc_comprehension_section():
     q=m.norm({'id':'p1','text':'What happened?', 'options':{'a':'A','b':'B'},'correctAnswer':'a','hasPassage':True,'section':'The passage.'})
     assert q['q'].startswith('The passage.')
+
+
+def test_unseen_first_cursor_persistence_and_repeat_fallback(monkeypatch):
+    calls=[]
+    def page(slug, n, cursor=None):
+        start=int(cursor or 0); end=min(start+n,150); calls.append(start)
+        return ([{'id':str(i),'q':f'Variety {i}','o':['yes','no'],'a':0} for i in range(start,end)],
+                {'nextCursor':str(end),'hasMore':end<150})
+    monkeypatch.setattr(m,'_aloc_page',page)
+    with m.Session.begin() as db:
+        db.query(m.QuestionBank).delete(); db.query(m.BankProgress).delete()
+    first=m.get_q('biology',60)
+    seen={m.question_key(q):(1,1) for q in first}
+    second=m.get_q('biology',60,seen)
+    assert not set(map(m.question_key,first)) & set(map(m.question_key,second))
+    assert calls == list(range(0,135,15))
+    # Independent DB sessions retain the bank and paging cursor.
+    with m.Session() as db:
+        assert db.get(m.BankProgress,'biology').cursor=='135'
+    seen.update({m.question_key(q):(1,2) for q in second})
+    third=m.get_q('biology',60,seen)
+    assert len({m.question_key(q) for q in third})==60
+    assert sum(q['repeated'] for q in third)==30
+    # Repeats come from the older sitting when usage counts match.
+    assert {m.question_key(q) for q in third if q['repeated']} <= set(map(m.question_key,first))
+    before=len(calls);m.get_q('biology',60,{})
+    assert len(calls)==before
+
+
+def test_provider_failure_uses_saved_bank_without_repeated_calls(monkeypatch):
+    with m.Session.begin() as db:
+        db.query(m.QuestionBank).delete();db.query(m.BankProgress).delete()
+        for i in range(60):
+            q={'id':str(i),'q':f'Cached {i}','o':['yes','no'],'a':0}
+            db.add(m.QuestionBank(subject='physics',fingerprint=m.question_key(q),data=q))
+    calls=[]
+    def unavailable(*args):
+        calls.append(1);raise m.HTTPException(502,'Question provider returned HTTP 429.')
+    monkeypatch.setattr(m,'_aloc_page',unavailable)
+    assert len(m.get_q('physics',60))==60
+    assert len(m.get_q('physics',60))==60
+    assert len(calls)==1
+
+
+def test_history_is_per_student_and_answers_stay_private():
+    teacher=signup('08000000008'); other=signup('08000000009')
+    with m.Session.begin() as db:
+        u=db.query(m.User).filter_by(phone='08000000008').one()
+        v=db.query(m.User).filter_by(phone='08000000009').one()
+        q={'s':'Physics','q':'History question','o':['x','y'],'a':0,'repeated':True}
+        a=m.Attempt(user_id=u.id,kind='aloc',qdata=[q],answers={},deadline=time.time()+100,submitted=True)
+        db.add(a);db.flush()
+        assert m.question_history(db,u.id)['physics'][m.question_key(q)][0]==1
+        assert not m.question_history(db,v.id)
+        assert m.payload(a)['repeated_questions']==1
+        assert 'a' not in m.payload(a)['questions'][0]

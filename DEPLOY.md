@@ -33,3 +33,11 @@ https://supabase.com/docs/guides/database/connecting-to-postgres
 No AI provider or AI key is required. Provide 1–100 numbered questions with A–D or A–E options, followed by an Answer key section with entries such as 1. B. Every question needs an answer. Upload a text PDF (maximum 10 MB, 25 pages). Scans and image-bearing PDFs are rejected. Review the draft before publishing. Tests use the teacher key for deterministic marking.
 
 Required server settings: DATABASE_URL, JWT_SECRET, ALOC_TOKEN; TEACHER_CODE for initial teacher registration. The existing Supabase application tables have been provisioned. Set the database connection privately in Render. Free hosting may still require provider account verification.
+
+Question variety: question_bank and question_bank_progress persist ALOC content and
+pagination cursors in PostgreSQL. Tables are backend-only with RLS and revoked
+anon/authenticated privileges. The backend creates missing tables at startup.
+Existing attempt records provide each student's question history. Selection prefers
+unseen, then least-used/oldest questions, randomising ties. Bank growth is demand-led,
+limited to eight provider pages per subject per start, with a five-minute cooldown
+on provider errors. Repeats are explicitly reported. No extra subscription is created.
